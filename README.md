@@ -2,6 +2,8 @@
 
 Battle-tested email archaeology application that allows you to search and compile reports from multiple accounts. NeuralMail does not let you compose or sent emails, it tackles the problem of finding things of which you know they "must be in some email".
 
+![NeuralMail demo](neuralmail_release.gif)
+
 ## Features ✨
 
 - **Multiple IMAP Account Support** 💼: Manage and search across multiple email accounts simultaneously.
