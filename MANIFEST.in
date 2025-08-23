@@ -1,0 +1,28 @@
+# Include documentation
+include README.md
+include LICENSE
+include requirements.txt
+
+# Include application resources
+include neuralmail/icon.ico
+
+# Include configuration files
+include neuralmail/nuitka_config.md
+
+# Exclude sensitive files and build artifacts
+exclude config.json
+exclude config.json.*
+exclude *.db
+exclude *.log
+exclude background_info.txt
+recursive-exclude research_logs *
+recursive-exclude __pycache__ *
+recursive-exclude .git *
+recursive-exclude .idea *
+recursive-exclude .vscode *
+recursive-exclude dist *
+exclude build.bat
+exclude build_executable.py
+exclude EMAIL_VISUALIZER_README.md
+exclude email_embedding_visualizer.py
+exclude email_visualizer.log
