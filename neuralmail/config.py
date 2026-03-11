@@ -55,6 +55,7 @@ def create_default_config():
         "embedding_api_key": "YOUR_OPENAI_API_KEY",
         "embedding_base_url": None,
         "max_tokens": 8000,
+        "llm_max_context": 256000,
         "accounts": [
             {
                 "account_name": "Default Account",

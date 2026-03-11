@@ -1,13 +1,16 @@
-# Core dependencies
-PyQt5>=5.15.0
-openai>=1.0.0
-numpy>=1.21.0
-tiktoken>=0.5.0
-html2text>=2020.1.16
-PyPDF2>=3.0.0
-python-docx>=0.8.11
-configparser>=5.0.0
-markdown2>=2.4.0
+llama-index
+llama-index-embeddings-huggingface
+llama-index-embeddings-ollama
+llama-index-embeddings-openai
+llama-index-llms-ollama
+llama-index-llms-openai
+markdown2
+PyQt5
+sentence-transformers
+einops
+tqdm
+# For PyInstaller
+pywin32-ctypes
 
 # Visualization dependencies (for research tools)
 matplotlib>=3.5.0

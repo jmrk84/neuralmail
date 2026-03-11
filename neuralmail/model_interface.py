@@ -3,7 +3,7 @@ import json
 import openai
 import tiktoken
 from typing import Dict, List, Any, Optional, Tuple
-from .utils import openai_api_client
+from .utils import openai_api_client, prepare_openrouter_request_params
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +59,9 @@ class ModelInterface:
                 f"Model '{model}' not found in tiktoken, using cl100k_base encoding as fallback"
             )
 
-        self.max_tokens = (
-            256000
-        )
+        # Import config here to get user's llm_max_context setting
+        from .config import config
+        self.user_max_context = config.get("llm_max_context", 256000)
         self.token_usage_history = []  # Track token usage across calls
 
     def _create_client(self):
@@ -234,10 +234,14 @@ Always format your tool calls as valid JSON objects. For example:
         system_prompt = self.generate_system_prompt(tools)
         system_tokens = self._count_tokens(system_prompt)
 
-        # Calculate available tokens for dynamic content - utilizing much more of the context window
+        # Calculate effective max tokens by subtracting 4k for response
+        # Use user setting but be prepared to adjust if model has lower limits
+        effective_max_tokens = self.user_max_context - 4000
+        
+        # Calculate available tokens for dynamic content
         available_tokens = (
-            self.max_tokens - system_tokens - 2000
-        )  # Reserve tokens for response
+            effective_max_tokens - system_tokens
+        )  # Already reserved 4000 tokens for response
 
         # Allocate tokens between context and scratch pad - prioritize scratch pad more now
         # since it contains the accumulated relevant information
@@ -301,14 +305,20 @@ If you have gathered enough relevant information in the scratch pad to answer th
 Respond with a JSON object specifying the tool and parameters."""
 
         try:
-            # Call the model
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            # Prepare request parameters with OpenRouter provider routing
+            base_params = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message_for_model},
                 ],
+            }
+            request_params = prepare_openrouter_request_params(
+                self.base_url, self.model, base_params
             )
+            
+            # Call the model
+            response = self.client.chat.completions.create(**request_params)
 
             # Track token usage
             usage = response.usage
@@ -350,8 +360,17 @@ Respond with a JSON object specifying the tool and parameters."""
                 logger.warning(
                     "Context length exceeded, reducing context for next iteration"
                 )
-                # Reduce max_tokens for future calls
-                self.max_tokens = int(self.max_tokens * 0.8)
+                # Extract actual model limit from error message if possible
+                import re
+                match = re.search(r"maximum context length of (\d+) tokens", str(e))
+                if match:
+                    actual_model_limit = int(match.group(1))
+                    # Set user context to model limit minus 4k for response
+                    self.user_max_context = actual_model_limit - 4000
+                    logger.info(f"Detected model limit of {actual_model_limit}, adjusting context to {self.user_max_context}")
+                else:
+                    # Fallback: reduce by 20%
+                    self.user_max_context = int(self.user_max_context * 0.8)
             logger.error(f"OpenAI API error: {e}")
 
             # Log error to HTML if research_tools is provided

@@ -2,11 +2,12 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from .research_agent import ResearchAgent
 import logging
 import traceback
-from typing import List
+from typing import List, Dict
 from .config import config
 import os
 import sqlite3
 from pathlib import Path
+from .utils import prepare_openrouter_request_params
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +89,17 @@ class DeepResearchWorker(QThread):
 
 **Refined Search Query:**"""
 
-                        response = agent.openai_client.chat.completions.create(
-                            model=config.get("llm_model"),
-                            messages=[{"role": "user", "content": elaboration_prompt}],
-                            max_tokens=400,
+                        # Prepare request parameters with OpenRouter provider routing
+                        base_params = {
+                            "model": config.get("llm_model"),
+                            "messages": [{"role": "user", "content": elaboration_prompt}],
+                            "max_tokens": 400,
+                        }
+                        request_params = prepare_openrouter_request_params(
+                            config.get("llm_base_url"), config.get("llm_model"), base_params
                         )
+                        
+                        response = agent.openai_client.chat.completions.create(**request_params)
 
                         elaborated_query = response.choices[0].message.content.strip()
                         logger.info(f"Original research query: {query}")
@@ -112,6 +119,15 @@ class DeepResearchWorker(QThread):
         total_start_time = time.time()
 
         try:
+            # --- Query Elaboration ---
+            elaboration_start_time = time.time()
+            # No query elaboration is performed in this version, so we set the value to 0
+            # In a future version, query elaboration logic can be added here
+            self.timing_data["query_elaboration"] = 0
+            
+            # --- Research Processing ---
+            research_start_time = time.time()
+
             # 1. Initialize a single research agent for all accounts
             self.progress.emit("Initializing research process...")
             db_paths = [
@@ -193,10 +209,16 @@ class DeepResearchWorker(QThread):
                     agent.tools.add_to_scratch_pad(
                         f"Summary from parallel round {i+1}:\n{summary}"
                     )
+            
+            self.timing_data["research_processing"] = time.time() - research_start_time
 
+            # --- Final Synthesis ---
+            synthesis_start_time = time.time()
             # 6. Final Synthesis with post-processing of citation IDs
             self.progress.emit("Synthesizing final response...")
             final_response = agent._synthesize_final_response(self.query)
+            
+            self.timing_data["response_synthesis"] = time.time() - synthesis_start_time
 
             # 7. Post-process: Replace [[CID:...]] with numeric citations and build source list
             try:

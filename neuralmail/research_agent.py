@@ -5,6 +5,8 @@ from .research_tools import ResearchTools
 import json
 import traceback
 from pathlib import Path
+from .config import config
+from .utils import truncate_messages_for_context, count_tokens, prepare_openrouter_request_params
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class ResearchAgent:
         self._original_methods = {}  # Store original method implementations
         self.progress_callback = progress_callback  # Add progress callback
         self.key_emails = set()  # Store email IDs that contributed to the research
+        
         logger.info(
             "Research agent initialized with expanded context window capabilities"
         )
@@ -83,32 +86,55 @@ Instructions:
 JSON list of {num_queries} search queries:"""
 
         try:
-            # Using response_format for reliable JSON output
-            response = self.model.client.chat.completions.create(
-                model=self.model.model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
+            # Check if we're using OpenAI's API or models that support response_format
+            is_openai_api = (
+                self.model.base_url is None or 
+                "api.openai.com" in self.model.base_url
             )
+            
+            # Gemini models on OpenRouter also support response_format
+            is_gemini_openrouter = (
+                self.model.base_url and 
+                "openrouter.ai" in self.model.base_url and 
+                self.model.model and 
+                "gemini" in self.model.model.lower()
+            )
+            
+            supports_response_format = is_openai_api or is_gemini_openrouter
+            
+            # Prepare base request parameters
+            messages = [{"role": "user", "content": prompt}]
+            truncated_messages = truncate_messages_for_context(messages, 800)  # Account for 800 response tokens
+            
+            base_params = {
+                "model": self.model.model,
+                "messages": truncated_messages,
+                "max_tokens": 800,  # Limit for query generation
+            }
+            
+            # Only use response_format for APIs that support it
+            if supports_response_format:
+                base_params["response_format"] = {"type": "json_object"}
+            
+            # Apply OpenRouter provider routing if specified
+            request_params = prepare_openrouter_request_params(
+                self.model.base_url, self.model.model, base_params
+            )
+            
+            response = self.model.client.chat.completions.create(**request_params)
 
             queries_str = response.choices[0].message.content
-            # The response should be a JSON object, e.g., {"queries": ["q1", "q2"]}
-            data = json.loads(queries_str)
-
-            queries = []
-            if isinstance(data, list):
-                queries = data
-            elif isinstance(data, dict):
-                # Look for a list of strings in the dictionary's values
-                for key, value in data.items():
-                    if isinstance(value, list) and all(
-                        isinstance(i, str) for i in value
-                    ):
-                        queries = value
-                        break
+            
+            if not queries_str or queries_str.strip() == "":
+                logger.warning("Received empty response from model, falling back to single query")
+                return [query]  # Fallback to original query
+            
+            # Try to parse JSON response
+            queries = self._parse_queries_response(queries_str, num_queries)
 
             if not queries:
                 raise ValueError(
-                    f"JSON response from model did not contain a list of queries. Got: {data}"
+                    f"JSON response from model did not contain a list of queries. Got: {queries_str}"
                 )
 
             logger.info(f"Generated {len(queries)} parallel queries: {queries}")
@@ -121,6 +147,66 @@ JSON list of {num_queries} search queries:"""
             logger.error(traceback.format_exc())
             # Fallback to just the original query in case of failure
             return [query]
+
+    def _parse_queries_response(self, queries_str: str, num_queries: int) -> List[str]:
+        """
+        Parse the model's response to extract a list of queries.
+        Handles both JSON objects and plain text responses.
+        """
+        queries = []
+        
+        try:
+            # First, try to parse as JSON
+            data = json.loads(queries_str)
+            
+            if isinstance(data, list):
+                # Response is a direct JSON list: ["query1", "query2", ...]
+                queries = [str(q) for q in data if isinstance(q, str)]
+            elif isinstance(data, dict):
+                # Response is a JSON object: {"queries": ["query1", "query2", ...]}
+                for key, value in data.items():
+                    if isinstance(value, list) and all(isinstance(i, str) for i in value):
+                        queries = value
+                        break
+                        
+        except (json.JSONDecodeError, TypeError):
+            # JSON parsing failed, try to parse as plain text
+            logger.info("JSON parsing failed, attempting to parse as plain text")
+            queries = self._parse_text_queries(queries_str)
+        
+        # Filter out empty queries and limit to requested number
+        queries = [q.strip() for q in queries if q.strip()]
+        return queries[:num_queries] if queries else []
+
+    def _parse_text_queries(self, text: str) -> List[str]:
+        """
+        Parse queries from plain text response.
+        Handles various text formats that models might use.
+        """
+        queries = []
+        lines = text.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Remove common prefixes/bullets
+            prefixes = ['- ', '* ', '1. ', '2. ', '3. ', '4. ', '5. ', '"', "'"]
+            for prefix in prefixes:
+                if line.startswith(prefix):
+                    line = line[len(prefix):].strip()
+            
+            # Remove trailing quotes or periods
+            if line.endswith('"') or line.endswith("'"):
+                line = line[:-1].strip()
+            if line.endswith('.'):
+                line = line[:-1].strip()
+                
+            if line and len(line) > 10:  # Reasonable minimum query length
+                queries.append(line)
+        
+        return queries
 
     def summarize_results(self, query: str, parallel_results: List[str]) -> str:
         """
@@ -159,9 +245,20 @@ Instructions:
 CONSOLIDATED SUMMARY (with inline [[CID:...]] where applicable):"""
 
         try:
-            response = self.model.client.chat.completions.create(
-                model=self.model.model, messages=[{"role": "user", "content": prompt}]
+            # Prepare request parameters with OpenRouter provider routing
+            messages = [{"role": "user", "content": prompt}]
+            truncated_messages = truncate_messages_for_context(messages, 2000)  # Account for 2000 response tokens
+            
+            base_params = {
+                "model": self.model.model, 
+                "messages": truncated_messages,
+                "max_tokens": 2000,  # Limit for summarization
+            }
+            request_params = prepare_openrouter_request_params(
+                self.model.base_url, self.model.model, base_params
             )
+            
+            response = self.model.client.chat.completions.create(**request_params)
 
             summary = response.choices[0].message.content.strip()
             logger.info("Successfully summarized parallel search results.")
@@ -346,14 +443,23 @@ TOOL RESULT:
 Extract ONLY the most relevant information that helps answer the query."""
 
         try:
-            response = self.model.client.chat.completions.create(
-                model=self.model.model,
-                messages=[
-                    {"role": "system", "content": extraction_system_prompt},
-                    {"role": "user", "content": extraction_user_prompt},
-                ],
+            # Prepare request parameters with OpenRouter provider routing
+            messages = [
+                {"role": "system", "content": extraction_system_prompt},
+                {"role": "user", "content": extraction_user_prompt},
+            ]
+            truncated_messages = truncate_messages_for_context(messages, 1500)  # Account for 1500 response tokens
+            
+            base_params = {
+                "model": self.model.model,
+                "messages": truncated_messages,
+                "max_tokens": 1500,  # Limit for information extraction
+            }
+            request_params = prepare_openrouter_request_params(
+                self.model.base_url, self.model.model, base_params
             )
-
+            
+            response = self.model.client.chat.completions.create(**request_params)
             extracted_info = response.choices[0].message.content.strip()
 
             if not extracted_info or extracted_info.lower().startswith(
@@ -431,16 +537,26 @@ Instructions:
 DETAILED RESPONSE (preserve any [[CID:...]] markers present):"""
 
         try:
-            response = self.model.client.chat.completions.create(
-                model=self.model.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful research assistant providing final answers based on collected information.",
-                    },
-                    {"role": "user", "content": synthesis_prompt},
-                ],
+            # Prepare request parameters with OpenRouter provider routing
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful research assistant providing final answers based on collected information.",
+                },
+                {"role": "user", "content": synthesis_prompt},
+            ]
+            truncated_messages = truncate_messages_for_context(messages, 4000)  # Account for 4000 response tokens
+            
+            base_params = {
+                "model": self.model.model,
+                "messages": truncated_messages,
+                "max_tokens": 4000,  # Limit response to 4k tokens
+            }
+            request_params = prepare_openrouter_request_params(
+                self.model.base_url, self.model.model, base_params
             )
+            
+            response = self.model.client.chat.completions.create(**request_params)
             final_response = response.choices[0].message.content
             return final_response
         except Exception as e:

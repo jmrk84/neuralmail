@@ -23,6 +23,7 @@ import logging
 import random
 import traceback
 import imaplib
+from typing import Dict
 from .config import config, save_config
 
 
@@ -55,13 +56,13 @@ from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, QSize
 import openai
 import PyPDF2
 import io
+import tiktoken
 
 import markdown2
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table
 
-# Import the parallel email sync worker
 from .parallel_email_sync import ParallelEmailSyncWorker
 from .deep_research_worker import DeepResearchWorker
 from .research_agent import ResearchAgent
@@ -72,8 +73,10 @@ from .utils import (
     get_embedding,
     openai_api_client,
     cosine_similarity,
+    truncate_messages_for_context,
+    count_tokens,
+    prepare_openrouter_request_params,
 )
-
 
 class BackgroundAnalysisWorker(QThread):
     """Worker thread for analyzing emails to create background information about the user."""
@@ -163,7 +166,6 @@ Please perform a thorough analysis to create a comprehensive profile."""
                 self.error.emit("Background analysis failed to produce a result.")
                 return
 
-            # Save to file
             with open("background_info.txt", "w", encoding="utf-8") as f:
                 f.write(background_info)
 
@@ -181,15 +183,77 @@ Please perform a thorough analysis to create a comprehensive profile."""
 MAX_SYNC_WORKERS = 10  # Maximum worker threads for parallel email sync
 
 # Set up logging to a single file and console
+# Configure file handler with UTF-8 encoding
+file_handler = logging.FileHandler("neuralmail.log", encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# Configure console handler with UTF-8 encoding and error handling
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+# Handle encoding errors gracefully by replacing problematic characters
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except:
+        pass  # If reconfigure fails, continue with fallback
+
+# Set formatter for both handlers
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler("neuralmail.log"),
-        logging.StreamHandler(sys.stdout),  # Log to console
-    ],
+    handlers=[file_handler, console_handler],
 )
 logger = logging.getLogger(__name__)
+
+
+def prepare_openrouter_request_params(base_url: str, model: str, base_params: Dict) -> Dict:
+    """
+    Prepare request parameters with OpenRouter provider routing if specified.
+    
+    Args:
+        base_url: The API base URL
+        model: The model name (may contain provider after :)
+        base_params: Base request parameters
+        
+    Returns:
+        Updated request parameters with provider routing if applicable
+    """
+    request_params = base_params.copy()
+    
+    # Parse provider from model name if using OpenRouter
+    if base_url and "openrouter.ai" in base_url and ":" in model:
+        parts = model.split(":", 1)
+        actual_model_name = parts[0]
+        provider_name = parts[1]
+        
+        # Update model name to remove provider suffix
+        request_params["model"] = actual_model_name
+        
+        # Add provider routing
+        request_params["provider"] = {
+            "only": [provider_name],
+            "allow_fallbacks": False
+        }
+    
+    return request_params
+
+
+# Helper function to sanitize log messages with problematic Unicode characters
+def sanitize_log_message(message):
+    """
+    Sanitize a log message to handle Unicode characters that might cause encoding issues.
+    """
+    if not isinstance(message, str):
+        message = str(message)
+    
+    # Encode to ASCII with error handling - replaces problematic Unicode characters
+    message = message.encode('ascii', errors='replace').decode('ascii')
+    
+    return message
 
 
 # Helper function to write to log file only (not console)
@@ -353,6 +417,8 @@ class QueryWorker(QThread):
             "total_query_time": 0,
             "prompt_tokens_reranking": 0,
             "completion_tokens_reranking": 0,
+            "prompt_tokens_response_generation": 0,
+            "completion_tokens_response_generation": 0,
         }
         self.augmented_query = ""
 
@@ -368,7 +434,7 @@ class QueryWorker(QThread):
         num_to_request = 40
         max_tokens_for_reranking = 200
 
-        if max_context <= 32000:
+        if max_context <= 64000:
             emails_to_process = top_emails[:100]
             body_snippet_words = 25
             num_to_request = 20
@@ -417,21 +483,80 @@ The current date and time is {current_date_time}. Use this information if the qu
 1. Analyze the user's query and the provided email summaries.
 2. Consider the user's background information for context.
 3. Identify the emails that are most relevant to the query.
-4. Your response must be a comma-separated list of the numbers of the top {num_to_request} most relevant emails, in descending order of relevance.
-5. For example: 5, 12, 1, 35, 2, ...
-6. Do not include any other text, explanation, or formatting. Only provide the comma-separated list of numbers.
+4. Your response must be a JSON object with a "rankings" array containing the numbers of the top {num_to_request} most relevant emails, in descending order of relevance.
+5. For example: {{"rankings": [5, 12, 1, 35, 2]}}
+6. Do not include any other text, explanation, or formatting. Only provide the JSON object.
 
 **Top {num_to_request} re-ranked email numbers:**"""
 
         try:
             write_to_log_file_only(f"Re-ranking Input Prompt:\n{rerank_prompt}")
 
-            response = client.chat.completions.create(
-                model=config.get("llm_model"),
-                messages=[{"role": "user", "content": rerank_prompt}],
-                max_tokens=max_tokens_for_reranking,  # Enough for 40 numbers + commas
-                temperature=0.0,  # Deterministic output
+            # Check if we're using OpenAI's API or models that support response_format
+            base_url = config.get("llm_base_url")
+            model_name = config.get("llm_model")
+            
+            is_openai_api = (
+                base_url is None or 
+                "api.openai.com" in base_url
             )
+            
+            # Gemini models on OpenRouter also support response_format
+            is_gemini_openrouter = (
+                base_url and 
+                "openrouter.ai" in base_url and 
+                model_name and 
+                "gemini" in model_name.lower()
+            )
+            
+            supports_response_format = is_openai_api or is_gemini_openrouter
+            
+            # Parse provider from model name if using OpenRouter
+            provider_name = None
+            actual_model_name = model_name
+            if base_url and "openrouter.ai" in base_url and ":" in model_name:
+                parts = model_name.split(":", 1)
+                actual_model_name = parts[0]
+                provider_name = parts[1]
+            
+            # Debug output for provider detection
+            print(f"DEBUG: Re-ranking provider detection:")
+            print(f"   Base URL: {base_url}")
+            print(f"   Model: {model_name}")
+            print(f"   Actual model: {actual_model_name}")
+            print(f"   Provider: {provider_name}")
+            print(f"   OpenAI API: {is_openai_api}")
+            print(f"   Gemini OpenRouter: {is_gemini_openrouter}")
+            print(f"   Supports response_format: {supports_response_format}")
+            
+            # Prepare messages and truncate if necessary
+            messages = [{"role": "user", "content": rerank_prompt}]
+            truncated_messages = truncate_messages_for_context(messages, max_tokens_for_reranking)
+            
+            # Prepare request parameters
+            request_params = {
+                "model": actual_model_name,
+                "messages": truncated_messages,
+                "max_tokens": max_tokens_for_reranking,
+                "temperature": 0.0,
+            }
+            
+            # Only use response_format for APIs that support it
+            if supports_response_format:
+                request_params["response_format"] = {"type": "json_object"}
+                print("DEBUG: Using JSON response format")
+            else:
+                print("DEBUG: Using plain text response format")
+            
+            # Add OpenRouter provider routing if specified
+            if provider_name and base_url and "openrouter.ai" in base_url:
+                request_params["provider"] = {
+                    "only": [provider_name],
+                    "allow_fallbacks": False
+                }
+                print(f"DEBUG: Using exclusive provider routing to: {provider_name}")
+
+            response = client.chat.completions.create(**request_params)
 
             if response.usage:
                 self.timing_data["prompt_tokens_reranking"] = response.usage.prompt_tokens
@@ -442,11 +567,19 @@ The current date and time is {current_date_time}. Use this information if the qu
             reranked_indices_str = response.choices[0].message.content.strip()
             logger.info(f"LLM response for re-ranking: {reranked_indices_str}")
 
-            reranked_indices = [
-                int(i.strip()) - 1
-                for i in reranked_indices_str.split(",")
-                if i.strip().isdigit()
-            ]
+            # Parse the response - try JSON first, then fall back to comma-separated format
+            reranked_indices = self._parse_reranking_response(reranked_indices_str)
+            
+            # If parsing fails, output debug info to console
+            if not reranked_indices:
+                print(f"\nDEBUG: Re-ranking failed!")
+                print(f"Raw LLM response: '{reranked_indices_str}'")
+                print(f"Response length: {len(reranked_indices_str)}")
+                print(f"Response repr: {repr(reranked_indices_str)}")
+                if reranked_indices_str:
+                    print(f"First 200 chars: {reranked_indices_str[:200]}")
+                else:
+                    print("Response is empty!")
 
             reranked_emails = []
             seen_indices = set()
@@ -462,6 +595,74 @@ The current date and time is {current_date_time}. Use this information if the qu
             logger.error(f"Error re-ranking emails: {e}")
             logger.warning("Falling back to original similarity ranking.")
             return top_emails[:num_to_request]
+
+    def _parse_reranking_response(self, response_str: str):
+        """
+        Parse the model's response to extract a list of email indices.
+        Handles both JSON objects and plain text responses.
+        """
+        indices = []
+        
+        # First check if response is empty
+        if not response_str or not response_str.strip():
+            print("DEBUG: Empty response string received for re-ranking")
+            return indices
+        
+        try:
+            # First, try to parse as JSON
+            import json
+            data = json.loads(response_str)
+            print(f"DEBUG: Successfully parsed JSON: {data}")
+            
+            if isinstance(data, dict) and "rankings" in data:
+                # JSON object: {"rankings": [5, 12, 1, 35, 2]}
+                rankings = data["rankings"]
+                if isinstance(rankings, list):
+                    indices = [int(i) - 1 for i in rankings if isinstance(i, (int, str)) and str(i).strip().isdigit()]
+                    print(f"DEBUG: Extracted {len(indices)} indices from JSON object")
+            elif isinstance(data, list):
+                # Direct JSON list: [5, 12, 1, 35, 2]
+                indices = [int(i) - 1 for i in data if isinstance(i, (int, str)) and str(i).strip().isdigit()]
+                print(f"DEBUG: Extracted {len(indices)} indices from JSON array")
+                        
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            # JSON parsing failed, try to parse as comma-separated text
+            print(f"DEBUG: JSON parsing failed: {e}")
+            logger.info("JSON parsing failed, attempting to parse as comma-separated text")
+            indices = self._parse_text_rankings(response_str)
+        
+        print(f"DEBUG: Final parsed indices: {indices}")
+        return indices
+
+    def _parse_text_rankings(self, text: str):
+        """
+        Parse rankings from plain text response.
+        Handles various text formats that models might use.
+        """
+        indices = []
+        
+        print(f"DEBUG: Attempting to parse text: '{text}'")
+        
+        # Try comma-separated format first
+        comma_parts = text.split(",")
+        print(f"DEBUG: Split by comma: {comma_parts}")
+        
+        for i in comma_parts:
+            i_clean = i.strip()
+            if i_clean.isdigit():
+                indices.append(int(i_clean) - 1)
+        
+        print(f"DEBUG: Found {len(indices)} comma-separated numbers")
+        
+        # If no comma-separated numbers found, try extracting all numbers
+        if not indices:
+            import re
+            numbers = re.findall(r'\b\d+\b', text)
+            print(f"DEBUG: Regex found numbers: {numbers}")
+            indices = [int(n) - 1 for n in numbers if n.isdigit()]
+            print(f"DEBUG: Converted to {len(indices)} indices")
+        
+        return indices
 
     def run(self):
         total_start_time = time.time()
@@ -603,8 +804,8 @@ The current date and time is {current_date_time}. Use this information if the qu
 
         similarity_start_time = time.time()
 
-        # Unpack & Matrix Creation is now done at cache population.
-        # Email Norms calculation is now done at cache population.
+        # Unpack & Matrix Creation is done at cache population.
+        # Email Norms calculation is done at cache population.
 
         # Batch compute cosine similarity
         query_norm = np.linalg.norm(query_embedding)
@@ -626,13 +827,6 @@ The current date and time is {current_date_time}. Use this information if the qu
 
         self.timing_data["cosine_similarity"] += time.time() - similarity_start_time
 
-        # Log the top emails found by cosine similarity
-        # logger.info(f"Top emails from account {account['account_name']} by cosine similarity:")
-        # for idx, (sim, email_entry) in enumerate(top_emails, start=1):
-        #     logger.info(
-        #         f"#{idx} UID: {email_entry[1]}, Folder: {email_entry[2]}, "
-        #         f"Subject: {email_entry[3]}, From: {email_entry[4]}, To: {email_entry[5]}, Date: {email_entry[6]}, Similarity: {sim:.4f}"
-        #     )
         return top_emails
 
     def generate_response(self, top_emails, query, client):
@@ -734,22 +928,39 @@ The email number corresponds to the list of source emails that will be appended 
         try:
             gpt_start_time = time.time()
 
-            # Create streaming response
-            response_stream = client.chat.completions.create(
-                model=config.get("llm_model"),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=10000,
-                stream=True,  # Enable streaming
-                stream_options={
+            # Prepare messages and truncate if necessary
+            messages = [{"role": "user", "content": prompt}]
+            truncated_messages = truncate_messages_for_context(messages, 4000)
+            
+            # Prepare request parameters with OpenRouter provider routing
+            base_params = {
+                "model": config.get("llm_model"),
+                "messages": truncated_messages,
+                "max_tokens": 4000,
+                "stream": True,  # Enable streaming
+                "stream_options": {
                     "include_usage": True
                 },  # Request usage info with streaming
+            }
+            request_params = prepare_openrouter_request_params(
+                config.get("llm_base_url"), config.get("llm_model"), base_params
             )
+            
+            # Create streaming response
+            response_stream = client.chat.completions.create(**request_params)
 
             assistant_response = ""
             usage_info = None
 
             # Process streaming chunks
             for chunk in response_stream:
+                # Check for usage information (may arrive in a chunk with empty choices)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_info = chunk.usage
+
+                if not chunk.choices:
+                    continue
+
                 # Check for content in the chunk
                 if (
                     hasattr(chunk.choices[0].delta, "content")
@@ -757,12 +968,7 @@ The email number corresponds to the list of source emails that will be appended 
                 ):
                     content = chunk.choices[0].delta.content
                     assistant_response += content
-                    # Emit the streaming chunk
                     self.streaming_chunk.emit(content)
-
-                # Check for usage information (usually in the last chunk)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_info = chunk.usage
 
             self.timing_data["response_generation"] = time.time() - gpt_start_time
 
@@ -988,7 +1194,14 @@ class MainWindow(QWidget):
             self.streaming_started = False  # Flag to track if streaming has begun
             logger.info("Worker attributes initialized")
 
-            self.resize(1200, 600)
+            screen = QApplication.primaryScreen()
+            if screen:
+                avail = screen.availableGeometry()
+                w = min(900, avail.width() - 50)
+                h = min(500, avail.height() - 50)
+                self.resize(w, h)
+            else:
+                self.resize(900, 500)
             logger.info("Initial window size set")
 
             # Set up logging
@@ -1082,44 +1295,27 @@ class MainWindow(QWidget):
                 logger.error(f"Fallback icon loading also failed: {fallback_error}")
 
     def set_dpi_aware_minimum_size(self):
-        """Set DPI-aware minimum size based on screen DPI and content requirements."""
-        # Skip if UI is not yet initialized
-        if not hasattr(self, 'tabs') or not hasattr(self, 'settings_tab'):
-            return
-            
+        """Set DPI-aware minimum size based on screen DPI."""
         try:
-            # Get the screen DPI to calculate appropriate sizing
             screen = QApplication.primaryScreen()
             dpi = screen.logicalDotsPerInch()
-            base_dpi = 96.0  # Standard Windows DPI
-            dpi_scale = dpi / base_dpi
-            
-            # Base minimum sizes (designed for 96 DPI)
-            base_min_width = 800
-            base_min_height = 550  # Reduced base height since we'll scale it
-            
-            # Scale the minimum size based on DPI
+            dpi_scale = dpi / 96.0
+
+            base_min_width = 600
+            base_min_height = 400
             scaled_min_width = int(base_min_width * dpi_scale)
             scaled_min_height = int(base_min_height * dpi_scale)
-            
-            # Also consider the settings tab's actual content size hint
-            settings_hint = self.settings_tab.sizeHint()
-            if settings_hint.isValid():
-                # Add some padding and ensure we can accommodate the settings
-                content_based_height = settings_hint.height() + 100
-                # Use the larger of DPI-scaled or content-based height
-                scaled_min_height = max(scaled_min_height, content_based_height)
-            
-            # Set the calculated minimum size
+
+            screen_geom = screen.availableGeometry()
+            scaled_min_width = min(scaled_min_width, screen_geom.width() - 50)
+            scaled_min_height = min(scaled_min_height, screen_geom.height() - 50)
+
             self.setMinimumSize(scaled_min_width, scaled_min_height)
-            
             logger.info(f"Set DPI-aware minimum size: {scaled_min_width}x{scaled_min_height} (DPI: {dpi:.1f}, scale: {dpi_scale:.2f})")
-            
+
         except Exception as e:
             logger.error(f"Error setting DPI-aware minimum size: {e}")
-            # Fallback to reasonable defaults
-            self.setMinimumSize(800, 600)
-            logger.info("Using fallback minimum size: 800x600")
+            self.setMinimumSize(600, 400)
 
     def init_ui(self):
         self.setStyleSheet(
@@ -1187,12 +1383,16 @@ class MainWindow(QWidget):
         self.init_query_tab()
         self.tabs.addTab(self.search_tab, "Search")
 
-        # Create Settings Tab
+        # Create Settings Tab (scrollable)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QScrollArea.NoFrame)
         self.settings_tab = QWidget()
         self.settings_layout = QVBoxLayout(self.settings_tab)
         self.settings_layout.setAlignment(Qt.AlignTop)
         self.init_settings_tab()
-        self.tabs.addTab(self.settings_tab, "Settings")
+        settings_scroll.setWidget(self.settings_tab)
+        self.tabs.addTab(settings_scroll, "Settings")
 
         self.setLayout(main_layout)
 
@@ -1306,8 +1506,8 @@ class MainWindow(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumHeight(200)
-        scroll_area.setMaximumHeight(300)  # Allow some expansion but not too much
+        scroll_area.setMinimumHeight(100)
+        scroll_area.setMaximumHeight(250)
 
         scroll_content = QWidget()
         self.folder_layout = QVBoxLayout(scroll_content)
@@ -1377,7 +1577,7 @@ class MainWindow(QWidget):
         self.results_text_edit = QTextBrowser()
         self.results_text_edit.setReadOnly(True)
         self.results_text_edit.setOpenExternalLinks(True)  # Enable clickable links
-        self.results_text_edit.setMinimumHeight(400)
+        self.results_text_edit.setMinimumHeight(100)
         self.results_text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.results_text_edit.setContextMenuPolicy(Qt.NoContextMenu)
         query_layout.addWidget(self.results_text_edit, 1)  # Give it stretch factor of 1
@@ -1813,12 +2013,14 @@ class MainWindow(QWidget):
         # Allow UI to update
         QApplication.processEvents()
 
-        # Log progress message
-        logger.info(f"Research progress: {message}")
+        # Log progress message with sanitization to prevent Unicode encoding errors
+        sanitized_message = sanitize_log_message(message)
+        logger.info(f"Research progress: {sanitized_message}")
 
     def research_error(self, message: str):
         """Handle deep research errors."""
-        logger.error(f"Research error: {message}")
+        sanitized_message = sanitize_log_message(message)
+        logger.error(f"Research error: {sanitized_message}")
         QMessageBox.warning(
             self, "Research Error", f"Error during deep research: {message}"
         )
