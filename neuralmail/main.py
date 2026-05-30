@@ -78,6 +78,12 @@ from .utils import (
     prepare_openrouter_request_params,
 )
 
+# Absolute path to the bundled application icon. Resolved from this module's
+# location so it works regardless of the current working directory (the app is
+# launched with CWD set to the repo root, where icon.ico does NOT live).
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+
+
 class BackgroundAnalysisWorker(QThread):
     """Worker thread for analyzing emails to create background information about the user."""
 
@@ -1270,7 +1276,7 @@ class MainWindow(QWidget):
     def setup_application_icon(self):
         """Set up window icon - application icon is already set at app level."""
         try:
-            icon_path = "icon.ico"
+            icon_path = ICON_PATH
             if os.path.exists(icon_path):
                 # Create icon with multiple sizes for better display
                 icon = QIcon()
@@ -1291,8 +1297,8 @@ class MainWindow(QWidget):
             logger.error(f"Error setting up window icon: {e}")
             # Simple fallback
             try:
-                if os.path.exists("icon.ico"):
-                    self.setWindowIcon(QIcon("icon.ico"))
+                if os.path.exists(ICON_PATH):
+                    self.setWindowIcon(QIcon(ICON_PATH))
             except Exception as fallback_error:
                 logger.error(f"Fallback icon loading also failed: {fallback_error}")
 
@@ -2396,8 +2402,8 @@ def main():
         app.setOrganizationDomain("neuralmail.app")
 
         # Set the application icon at the QApplication level
-        if os.path.exists("icon.ico"):
-            app_icon = QIcon("icon.ico")
+        if os.path.exists(ICON_PATH):
+            app_icon = QIcon(ICON_PATH)
             app.setWindowIcon(app_icon)
 
         window = MainWindow()
