@@ -1170,7 +1170,7 @@ class MainWindow(QWidget):
             super().__init__()
             logger.info("Base QWidget initialized")
 
-            self.setWindowTitle("NeuralMail v1.0")
+            self.setWindowTitle("NeuralMail v1.1")
             self.settings = {}
             self.accounts = []  # List to store multiple account settings
             self.current_account_index = -1  # Index of currently selected account
@@ -1185,6 +1185,8 @@ class MainWindow(QWidget):
             self.emails_synced = False
             self.sync_workers = []
             self.sync_completed_count = 0
+            self.sync_error_count = 0
+            self.last_sync_error_message = ""
             self.total_sync_accounts = 0
             self.query_worker = None
             self.research_worker = None
@@ -1393,6 +1395,14 @@ class MainWindow(QWidget):
         self.init_settings_tab()
         settings_scroll.setWidget(self.settings_tab)
         self.tabs.addTab(settings_scroll, "Settings")
+
+        # Persistent sync status line at the bottom of the window.
+        # Replaces modal pop-ups for sync results (e.g. connection loss).
+        self.sync_status_label = QLabel("Last sync: never")
+        self.sync_status_label.setStyleSheet(
+            "color: #666666; font-size: 9pt; padding: 2px 8px;"
+        )
+        main_layout.addWidget(self.sync_status_label)
 
         self.setLayout(main_layout)
 
@@ -1863,7 +1873,10 @@ class MainWindow(QWidget):
         # Create a list to track all sync workers
         self.sync_workers = []
         self.sync_completed_count = 0
+        self.sync_error_count = 0
+        self.last_sync_error_message = ""
         self.total_sync_accounts = len(accounts_to_sync)
+        self.set_sync_status("Syncing…")
 
         # Start a worker for each account
         for account in accounts_to_sync:
@@ -1888,23 +1901,76 @@ class MainWindow(QWidget):
 
     def account_sync_finished(self):
         self.sync_completed_count += 1
-        if self.sync_completed_count >= self.total_sync_accounts:
-            self.sync_button.setEnabled(True)
-            self.deep_research_checkbox.setEnabled(True)
-            self.background_button.setEnabled(True)
-            self.emails_synced = True
-            self.query_progress.setValue(100)
-            self.populate_initial_cache()
-            logger.info("Email cache cleared after sync.")
+        self.emails_synced = True
+        self._check_sync_completion()
 
     def sync_error(self, message):
+        # A sync worker failed (e.g. no internet connection). Instead of a modal
+        # pop-up per failing account, record it and surface it in the status line.
+        self.sync_error_count += 1
+        self.last_sync_error_message = message
+        logger.warning(f"Email sync error: {message}")
+        self._check_sync_completion()
+
+    def set_sync_status(self, text):
+        """Update the persistent sync status line at the bottom of the window."""
+        if hasattr(self, "sync_status_label"):
+            self.sync_status_label.setText(text)
+
+    def _summarize_sync_error(self, message):
+        """Turn a raw sync error into a short, user-friendly reason."""
+        msg = (message or "").lower()
+        connection_indicators = [
+            "connect",
+            "no connection",
+            "timed out",
+            "timeout",
+            "network",
+            "unreachable",
+            "getaddrinfo",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "socket",
+            "errno 11001",
+            "errno 11002",
+        ]
+        if any(indicator in msg for indicator in connection_indicators):
+            return "no connection"
+        first_line = (message or "").strip().splitlines()
+        short = first_line[0] if first_line else "unknown error"
+        return short[:80]
+
+    def _check_sync_completion(self):
+        """Finalize the UI once every account has reported (success or failure)."""
+        if (
+            self.sync_completed_count + self.sync_error_count
+        ) < self.total_sync_accounts:
+            return
+
+        # Re-enable controls now that all accounts have reported.
         self.sync_button.setEnabled(True)
         self.deep_research_checkbox.setEnabled(True)
         self.background_button.setEnabled(True)
-        QMessageBox.warning(
-            self, "Sync Error", f"Error during email synchronization: {message}"
-        )
-        self.query_progress.setValue(0)
+
+        # Reload the cache from whatever was synced successfully (or previously
+        # stored on disk if everything failed).
+        self.populate_initial_cache()
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M")
+        if self.sync_error_count == 0:
+            self.query_progress.setValue(100)
+            self.set_sync_status(f"Last sync: {timestamp}")
+        else:
+            self.query_progress.setValue(0)
+            reason = self._summarize_sync_error(self.last_sync_error_message)
+            if self.sync_completed_count > 0:
+                self.set_sync_status(
+                    f"Last sync: {timestamp} — {self.sync_completed_count}/"
+                    f"{self.total_sync_accounts} ok, "
+                    f"{self.sync_error_count} failed ({reason})"
+                )
+            else:
+                self.set_sync_status(f"Last sync failed: {timestamp} — {reason}")
 
     def search_emails(self):
         query = self.query_input.text()
@@ -2325,7 +2391,7 @@ def main():
         # Set application properties for better Windows integration
         app.setApplicationName("NeuralMail")
         app.setApplicationDisplayName("NeuralMail")
-        app.setApplicationVersion("1.0")
+        app.setApplicationVersion("1.1")
         app.setOrganizationName("NeuralMail")
         app.setOrganizationDomain("neuralmail.app")
 

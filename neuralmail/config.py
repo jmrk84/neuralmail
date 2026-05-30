@@ -47,7 +47,7 @@ def create_default_config():
     """Create a default configuration."""
     config = {
         "llm_provider": "openrouter",
-        "llm_model": "google/gemini-2.5-flash",
+        "llm_model": "~google/gemini-flash-latest",
         "llm_api_key": "YOUR_OPENAI_API_KEY",
         "llm_base_url": "https://openrouter.ai/api/v1",
         "embedding_provider": "openai",

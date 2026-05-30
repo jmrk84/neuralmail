@@ -17,7 +17,7 @@ with open(os.path.join(this_directory, 'requirements.txt'), encoding='utf-8') as
 
 setup(
     name="neuralmail",
-    version="1.0.0",
+    version="1.1.0",
     author="NeuralMail Team",
     author_email="contact@neuralmail.app",
     description="AI-powered email search and analysis tool with multi-account support",
